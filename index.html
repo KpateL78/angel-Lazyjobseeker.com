@@ -718,6 +718,11 @@
     
     <!-- JavaScript -->
     <script>
+        // Wrap the whole renderer in an IIFE so its top-level `const`/`let` bindings
+        // can't collide with non-configurable globals (e.g. `window.api` exposed by
+        // preload.js via contextBridge). A bare `const api = window.api;` at script top-level
+        // throws "Identifier 'api' has already been declared".
+        (function () {
         // Renderer talks to main only via the contextBridge-exposed window.api.
         // No direct require('electron') — nodeIntegration is disabled and contextIsolation is on.
         const api = window.api;
@@ -1146,6 +1151,7 @@
                 updateStatus('Failed to initialize microphone. Please check permissions.');
             }
         });
+        })();
     </script>
 </body>
 </html>
