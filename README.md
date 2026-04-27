@@ -4,8 +4,12 @@ Angel is a desktop application that helps you in meetings by providing real-time
 
 ## Features
 
-- **Live Transcription**: See your speech as text in real-time
-- **AI-Powered Answers**: Get concise and helpful responses using OpenAI's advanced models
+- **Live Transcription**: See your speech as text in real-time (Google Speech-to-Text streaming)
+- **AI-Powered Answers**: Concise responses streamed token-by-token from OpenAI
+- **Conversation Memory**: Each follow-up answer sees the prior transcripts and answers in the same chat
+- **Model Picker**: Switch between `gpt-4o`, `gpt-4o-mini`, and `gpt-3.5-turbo` from the toolbar
+- **Conversation Presets**: System-prompt presets for General / Interview / Sales call / Standup / Brainstorm
+- **Summarize + Action Items**: One click to generate a markdown summary + action items over the whole session
 - **Always-on-Top**: Angel stays visible over other applications
 - **Screen Sharing Mode**: Hide Angel from screen recordings with a single click
 - **Simple Interface**: Minimalist design that stays out of your way

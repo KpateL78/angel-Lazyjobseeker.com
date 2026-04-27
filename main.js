@@ -1,64 +1,134 @@
-const { app, BrowserWindow, ipcMain, systemPreferences } = require('electron')
-const path = require('path')
-const fs = require('fs')
-const speech = require('@google-cloud/speech')
-const record = require('node-record-lpcm16')
-const textToSpeech = require('@google-cloud/text-to-speech')
-const OpenAI = require('openai')
+const { app, BrowserWindow, ipcMain } = require('electron');
+const path = require('path');
+const fs = require('fs');
 
-// Global variables
-let mainWindow = null
-let recording = null
-let isRecording = false
-let recognizeStream = null
-let currentTranscript = ''
-let answerDebounceTimer = null
-
-// Create a backup of window position and size for restoring
-let windowState = {
-  width: 500,
-  height: 400,
-  x: null,
-  y: null
-};
-
-// Add this to track if we're in screen sharing mode
-let isInScreenSharingMode = false;
-
-// Initialize OpenAI client with simple configuration
-const openai = new OpenAI({
-  apiKey: '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', // Replace with your actual key before using
-  maxRetries: 3, // Add retry logic
-  timeout: 60000 // 60 second timeout for the overall client, not per request
-});
-
-// Add this near the top with other platform-specific code
-const isWindows = process.platform === 'win32';
-
-// Function to get credentials path that works in both dev and production
-function getCredentialsPath() {
-  if (app.isPackaged) {
-    return path.join(process.resourcesPath, 'lazy-job-seeker-4b29b-eb0b308d0ba7.json')
-  } else {
-    return path.join(__dirname, 'lazy-job-seeker-4b29b-eb0b308d0ba7.json')
-  }
+// Load .env if present. dotenv is a no-op if the file is absent.
+try {
+  require('dotenv').config({ path: path.join(__dirname, '.env') });
+} catch (_) {
+  // dotenv is optional in packaged builds where env vars are set externally
 }
 
-// Initialize Google clients
-const speechClient = new speech.SpeechClient({
-  keyFilename: getCredentialsPath()
-})
+const speech = require('@google-cloud/speech');
+const textToSpeech = require('@google-cloud/text-to-speech');
+const OpenAI = require('openai');
 
-const ttsClient = new textToSpeech.TextToSpeechClient({
-  keyFilename: getCredentialsPath()
-})
+// -----------------------------------------------------------------------------
+// Configuration
+// -----------------------------------------------------------------------------
 
-// Update the createWindow function to handle Windows-specific settings
+const isWindows = process.platform === 'win32';
+
+const SUPPORTED_MODELS = ['gpt-4o', 'gpt-4o-mini', 'gpt-3.5-turbo'];
+const DEFAULT_MODEL = SUPPORTED_MODELS.includes(process.env.ANGEL_DEFAULT_MODEL)
+  ? process.env.ANGEL_DEFAULT_MODEL
+  : 'gpt-4o-mini';
+
+const PRESETS = {
+  general: {
+    label: 'General',
+    system:
+      "You are a helpful AI assistant in a meeting. Your answers must be brief, clear, and direct - no more than 2-3 sentences."
+  },
+  interview: {
+    label: 'Interview',
+    system:
+      "You are a coach helping the user answer interview questions in real time. Reply with a concise, structured answer in first person, no more than 4 sentences. Use the STAR method when relevant."
+  },
+  sales: {
+    label: 'Sales call',
+    system:
+      "You are a sales assistant. The user is on a sales call. Respond as if you were them: concise, persuasive, and focused on value, objections, and next steps. 2-3 sentences."
+  },
+  standup: {
+    label: 'Standup',
+    system:
+      "You are a standup helper. Keep answers in 1-2 short sentences with concrete blockers, progress, or next actions."
+  },
+  brainstorm: {
+    label: 'Brainstorm',
+    system:
+      "You are a creative brainstorming partner. Offer 3 short, distinct ideas as a bulleted list. Keep each idea under 15 words."
+  }
+};
+const DEFAULT_PRESET = PRESETS[process.env.ANGEL_DEFAULT_PRESET] ? process.env.ANGEL_DEFAULT_PRESET : 'general';
+
+// -----------------------------------------------------------------------------
+// State
+// -----------------------------------------------------------------------------
+
+let mainWindow = null;
+let recognizeStream = null;
+let isRecording = false;
+let currentTranscript = '';
+let isInScreenSharingMode = false;
+
+// In-memory conversation history (full transcript / answer pairs).
+// Reset by 'reset-transcript' or 'new-chat' from the renderer.
+/** @type {{role: 'user' | 'assistant', content: string}[]} */
+let conversation = [];
+
+let activeModel = DEFAULT_MODEL;
+let activePreset = DEFAULT_PRESET;
+let activeAnswerAbort = null;
+
+// -----------------------------------------------------------------------------
+// Credentials / clients
+// -----------------------------------------------------------------------------
+
+function resolveGoogleCredentialsPath() {
+  const envPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+  if (envPath && fs.existsSync(envPath)) return envPath;
+
+  // Production: look in the resources directory next to the app bundle.
+  if (app.isPackaged) {
+    const candidates = [
+      path.join(process.resourcesPath, 'gcp-credentials.json'),
+      path.join(process.resourcesPath, 'lazy-job-seeker-4b29b-eb0b308d0ba7.json')
+    ];
+    for (const c of candidates) {
+      if (fs.existsSync(c)) return c;
+    }
+    return candidates[0];
+  }
+
+  // Dev: look next to main.js.
+  const candidates = [
+    path.join(__dirname, 'gcp-credentials.json'),
+    path.join(__dirname, 'lazy-job-seeker-4b29b-eb0b308d0ba7.json')
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return candidates[0];
+}
+
+if (!process.env.OPENAI_API_KEY) {
+  console.error(
+    '[angel] OPENAI_API_KEY is not set. Set it in your environment or in a .env file. ' +
+      'See SETUP.md / .env.example for details.'
+  );
+}
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY || '',
+  maxRetries: 3,
+  timeout: 60000
+});
+
+const credentialsPath = resolveGoogleCredentialsPath();
+const speechClient = new speech.SpeechClient({ keyFilename: credentialsPath });
+// eslint-disable-next-line no-unused-vars
+const ttsClient = new textToSpeech.TextToSpeechClient({ keyFilename: credentialsPath });
+
+// -----------------------------------------------------------------------------
+// Window
+// -----------------------------------------------------------------------------
+
 function createWindow() {
-  // Configure window options with screen sharing compatibility in mind
-  const windowOptions = {
-    width: 500,
-    height: 400,
+  mainWindow = new BrowserWindow({
+    width: 560,
+    height: 520,
     alwaysOnTop: true,
     transparent: false,
     frame: true,
@@ -67,46 +137,58 @@ function createWindow() {
     backgroundColor: '#FFFFFF',
     titleBarStyle: 'default',
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      backgroundThrottling: false
+      // Lock down the renderer.
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: false, // sandbox: true breaks getUserMedia on some platforms; preload is still scoped via contextBridge
+      backgroundThrottling: false,
+      preload: path.join(__dirname, 'preload.js')
     }
-  };
-  
-  // Create the window
-  mainWindow = new BrowserWindow(windowOptions);
-  
-  // Load the HTML file
+  });
+
   mainWindow.loadFile('index.html');
-  
-  // Set up window for screen exclusion compatibility
+
   if (process.platform === 'darwin') {
     mainWindow.once('ready-to-show', () => {
       mainWindow.show();
-      
-      // Initialize with properties that make exclusion work better
       mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
       mainWindow.setWindowButtonVisibility(true);
-      
-      // Move to front to establish window layering
       app.dock.show();
       mainWindow.moveTop();
     });
   } else if (isWindows) {
-    // Windows-specific setup
     mainWindow.setSkipTaskbar(false);
     app.setAppUserModelId('com.lazyjobseeker.angel');
   }
-  
-  // Log when window is created
+
+  mainWindow.webContents.once('did-finish-load', () => {
+    sendConfig();
+  });
+
   console.log('Main window created');
 }
+
+function sendConfig() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('config', {
+    models: SUPPORTED_MODELS,
+    activeModel,
+    presets: Object.fromEntries(Object.entries(PRESETS).map(([k, v]) => [k, v.label])),
+    activePreset,
+    hasOpenAIKey: Boolean(process.env.OPENAI_API_KEY),
+    credentialsPath
+  });
+}
+
+// -----------------------------------------------------------------------------
+// Speech-to-Text streaming
+// -----------------------------------------------------------------------------
 
 function createRecognizeStream() {
   const request = {
     config: {
-      encoding: 'WEBM_OPUS',  // Changed to match browser's MediaRecorder format
-      sampleRateHertz: 48000, // Changed to match browser's MediaRecorder format (48kHz)
+      encoding: 'WEBM_OPUS',
+      sampleRateHertz: 48000,
       languageCode: 'en-US',
       enableAutomaticPunctuation: true,
       model: 'default',
@@ -116,240 +198,108 @@ function createRecognizeStream() {
         microphoneDistance: 'NEARFIELD',
         originalMediaType: 'AUDIO'
       },
-      enableVoiceActivityDetection: false,
       maxAlternatives: 1
     },
-    singleUtterance: false,
     interimResults: true
-  }
+  };
 
   return speechClient
     .streamingRecognize(request)
     .on('error', error => {
-      console.error('Error:', error)
+      console.error('Speech stream error:', error);
       if (error.code === 11 && isRecording) {
-        console.log('Stream timeout, creating new stream while preserving transcript')
-        if (recognizeStream) {
-          recognizeStream = createRecognizeStream()
-        }
+        // Stream timed out (>5min) — restart while preserving transcript.
+        console.log('Speech stream timeout — recreating');
+        recognizeStream = createRecognizeStream();
       }
-      if (mainWindow) {
-        mainWindow.webContents.send('transcript', currentTranscript)
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('transcript', currentTranscript);
       }
     })
     .on('data', data => {
-      if (data.results[0]) {
-        const result = data.results[0]
-        const transcript = result.alternatives[0].transcript
-        
-        if (result.isFinal) {
-          // For final results, append to the running transcript
-          currentTranscript = (currentTranscript + ' ' + transcript).trim()
-          if (mainWindow) {
-            mainWindow.webContents.send('transcript', currentTranscript)
-            // Removed automatic answer generation here
-          }
-        } else {
-          // For interim results, show the current transcript plus the interim result
-          // This gives the live transcription feel without modifying currentTranscript yet
-          if (mainWindow) {
-            const interimTranscript = (currentTranscript + ' ' + transcript).trim()
-            mainWindow.webContents.send('transcript', interimTranscript)
-            
-            // Removed debounced answer generation here
-          }
+      if (!data.results[0]) return;
+      const result = data.results[0];
+      const transcript = result.alternatives[0].transcript;
+
+      if (result.isFinal) {
+        currentTranscript = (currentTranscript + ' ' + transcript).trim();
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('transcript', currentTranscript);
         }
+      } else if (mainWindow && !mainWindow.isDestroyed()) {
+        const interim = (currentTranscript + ' ' + transcript).trim();
+        mainWindow.webContents.send('transcript', interim);
       }
-    })
+    });
 }
 
-// Update the toggle-recording handler to provide immediate feedback
-ipcMain.on('toggle-recording', async (event, isStarting) => {
-  // Clear timeout if there's any pending
-  if (answerDebounceTimer) {
-    clearTimeout(answerDebounceTimer);
-    answerDebounceTimer = null;
-  }
+// -----------------------------------------------------------------------------
+// IPC: recording / transcript
+// -----------------------------------------------------------------------------
 
-  // Handle recording start/stop based on explicit parameter
+ipcMain.on('toggle-recording', async (_event, isStarting) => {
   if (isStarting) {
-    // Starting a new recording session
-    console.log('Starting new recording session');
+    console.log('Starting recording session');
     isRecording = true;
-    // Reset transcript when starting a new recording
     currentTranscript = '';
     recognizeStream = createRecognizeStream();
-    
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.webContents.send('recording-started');
-      // Send empty transcript to UI
       mainWindow.webContents.send('transcript', '');
     }
+    return;
+  }
+
+  console.log('Stopping recording, generating answer');
+  isRecording = false;
+
+  if (recognizeStream) {
+    try {
+      recognizeStream.end();
+    } catch (e) {
+      console.error('Error ending recognizeStream:', e);
+    }
+    recognizeStream = null;
+  }
+
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send('recording-stopped');
+
+  if (currentTranscript && currentTranscript.trim().length > 0) {
+    try {
+      mainWindow.webContents.send('answer-status', 'Generating answer...');
+      await streamAnswer(currentTranscript);
+    } catch (error) {
+      console.error('Error generating answer:', error);
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('answer', 'Error generating answer. Please try again.');
+      }
+    }
   } else {
-    // Stopping recording - this should be fast
-    console.log('Stopping recording and generating answer');
-    isRecording = false;
-    
-    // Close the stream properly
-    if (recognizeStream) {
-      try {
-        recognizeStream.end();
-        recognizeStream = null;
-      } catch (error) {
-        console.error('Error ending recognizeStream:', error);
-      }
-    }
-    
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('recording-stopped');
-      
-      // Get answer immediately for the current transcript
-      if (currentTranscript && currentTranscript.trim().length > 0) {
-        try {
-          // Send a preliminary status message
-          mainWindow.webContents.send('answer-status', 'Generating answer...');
-          
-          // Generate answer with shorter timeout
-          await getOpenAIAnswer(currentTranscript);
-        } catch (error) {
-          console.error('Error generating answer:', error);
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            mainWindow.webContents.send('answer', 'Error generating answer. Please try again.');
-          }
-        }
-      } else {
-        mainWindow.webContents.send('answer', 'No speech detected. Please try again.');
-      }
-    }
+    mainWindow.webContents.send('answer', 'No speech detected. Please try again.');
   }
 });
 
-// Add this handler for stream audio chunks with proper error handling
-ipcMain.on('stream-audio-chunk', async (event, audioChunk) => {
+ipcMain.on('stream-audio-chunk', (_event, audioChunk) => {
   try {
-    // Skip processing if we're not recording
     if (!isRecording) return;
-    
-    // Create recognizeStream if it doesn't exist
     if (!recognizeStream || recognizeStream.destroyed) {
       recognizeStream = createRecognizeStream();
       isRecording = true;
     }
-    
-    // Write the chunk to the stream
     if (recognizeStream && !recognizeStream.destroyed) {
-      // Convert base64 audio chunk to buffer
-      const audioBuffer = Buffer.from(audioChunk, 'base64');
-      
+      const buffer = Buffer.from(audioChunk, 'base64');
       try {
-        recognizeStream.write(audioBuffer);
-      } catch (error) {
-        console.error('Stream write error:', error);
-        // Don't recreate the stream here to avoid infinite loops
-        // Just log the error and let the next chunk attempt to fix if needed
+        recognizeStream.write(buffer);
+      } catch (e) {
+        console.error('Stream write error:', e);
       }
     }
-  } catch (error) {
-    console.error('Error processing audio chunk:', error);
+  } catch (e) {
+    console.error('Error processing audio chunk:', e);
   }
 });
 
-// Optimize the OpenAI answer function for speed
-async function getOpenAIAnswer(transcript) {
-  try {
-    if (!transcript || transcript.trim().length === 0) {
-      console.log('Empty transcript, not sending to OpenAI');
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('answer', 'I couldn\'t hear anything. Please try again.');
-      }
-      return;
-    }
-
-    console.log('Sending to OpenAI:', transcript);
-    
-    // Send status update
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('answer-status', 'Generating answer...');
-    }
-
-    // Try with faster model first
-    const models = [
-      "gpt-3.5-turbo", // Fall back to more reliable model
-      "gpt-4o-mini"    // Try this first
-    ];
-    
-    let completion = null;
-    let modelIndex = 1; // Start with gpt-4o-mini
-    let error = null;
-    
-    while (!completion && modelIndex >= 0) {
-      try {
-        const model = models[modelIndex];
-        console.log(`Trying model: ${model}`);
-        
-        completion = await openai.chat.completions.create({
-          model: model,
-          messages: [
-            {
-              role: "system", 
-              content: "You are a helpful AI assistant in a meeting. Your answers must be brief, clear, and direct - no more than 2-3 sentences."
-            },
-            {
-              role: "user",
-              content: transcript
-            }
-          ],
-          temperature: 0.3, // Lower temperature for more predictable outputs
-          max_tokens: 100,  // Reduce token count for faster responses
-          presence_penalty: 0,
-          frequency_penalty: 0
-        });
-        
-      } catch (err) {
-        console.error(`Error with model ${models[modelIndex]}:`, err);
-        error = err;
-        modelIndex--; // Try the next model in the list
-      }
-    }
-
-    if (completion?.choices?.[0]?.message?.content) {
-      const answer = completion.choices[0].message.content;
-      console.log('Received answer from OpenAI:', answer);
-      
-      // Explicitly send answer to UI
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        console.log('Sending answer to UI');
-        mainWindow.webContents.send('answer', answer);
-      } else {
-        console.error('Main window not available for sending answer');
-      }
-    } else {
-      console.error('No answer content in OpenAI response');
-      
-      // Send appropriate error message
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        if (error) {
-          mainWindow.webContents.send('answer', `Sorry, I couldn't generate an answer: ${error.message}`);
-        } else {
-          mainWindow.webContents.send('answer', 'Could not generate an answer. Please try again.');
-        }
-      }
-    }
-  } catch (error) {
-    console.error('OpenAI API error:', error);
-    
-    // Provide more specific error message
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT') {
-        mainWindow.webContents.send('answer', 'The connection to the AI service timed out. Please try again.');
-      } else {
-        mainWindow.webContents.send('answer', `Sorry, I couldn't generate an answer: ${error.message}`);
-      }
-    }
-  }
-}
-
-// Add a new IPC event handler for stopping the stream
 ipcMain.on('stop-audio-stream', () => {
   if (recognizeStream && !recognizeStream.destroyed) {
     isRecording = false;
@@ -358,7 +308,6 @@ ipcMain.on('stop-audio-stream', () => {
   }
 });
 
-// Add this new function to reset transcript without creating a new chat
 ipcMain.on('reset-transcript', () => {
   currentTranscript = '';
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -366,248 +315,265 @@ ipcMain.on('reset-transcript', () => {
   }
 });
 
-// Completely rework the IPC handler for toggling screen sharing mode
-ipcMain.on('toggle-screen-sharing-mode', (event, isScreenSharing) => {
-  // Get current window position and size if not in sharing mode already
-  if (!isInScreenSharingMode && mainWindow) {
-    const position = mainWindow.getPosition();
-    const size = mainWindow.getSize();
-    windowState = {
-      width: size[0],
-      height: size[1],
-      x: position[0],
-      y: position[1]
-    };
-  }
-  
-  // Update tracking variable
-  isInScreenSharingMode = isScreenSharing;
-  
-  if (mainWindow) {
-    if (isScreenSharing) {
-      // On macOS, we need special handling
-      if (process.platform === 'darwin') {
-        try {
-          // Critical sequence for macOS - order matters
-          
-          // First make it invisible to screen sharing
-          mainWindow.setContentProtection(true);
-          console.log('Screen sharing exclusion activated on macOS');
-          
-          // Set window to be visible on all workspaces (including full screen)
-          mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
-          
-          // Use specific window level to ensure it stays on top but excluded
-          mainWindow.setAlwaysOnTop(true, "floating", 1);
-          
-          // Hide the traffic lights (window buttons)
-          mainWindow.setWindowButtonVisibility(false);
-          
-          // Apply a very slight opacity change (not visible to users)
-          // This is a crucial trick that helps with exclusion
-          mainWindow.setOpacity(0.99);
-          
-          // Get the window bounds and temporarily resize to force a redraw
-          const bounds = mainWindow.getBounds();
-          mainWindow.setBounds({ 
-            x: bounds.x, 
-            y: bounds.y, 
-            width: bounds.width + 1, 
-            height: bounds.height 
-          });
-          
-          // Restore original bounds after a brief delay
-          setTimeout(() => {
-            mainWindow.setBounds(bounds);
-          }, 10);
-          
-          // Force a repaint with vibrancy changes
-          mainWindow.setVibrancy('popover');
-          setTimeout(() => {
-            mainWindow.setVibrancy(null);
-          }, 50);
-        } catch (error) {
-          console.error('Failed to apply screen sharing protection on macOS:', error);
-        }
-      } 
-      // For Windows
-      else if (process.platform === 'win32') {
-        try {
-          // Windows approach is simpler
-          mainWindow.setContentProtection(true);
-          mainWindow.setAlwaysOnTop(true, "screen-saver", 1);
-          console.log('Screen sharing exclusion activated on Windows');
-        } catch (error) {
-          console.error('Failed to apply screen sharing protection on Windows:', error);
-        }
-      }
-      
-      // Notify renderer that screen sharing mode is active
-      mainWindow.webContents.send('screen-sharing-active', true);
-    } 
-    else {
-      try {
-        // Restore normal window behavior in exact opposite order
-        mainWindow.setOpacity(1.0);
-        
-        if (process.platform === 'darwin') {
-          mainWindow.setWindowButtonVisibility(true);
-          mainWindow.setVisibleOnAllWorkspaces(false);
-        }
-        
-        mainWindow.setAlwaysOnTop(true); // Keep on top but with default behavior
-        mainWindow.setContentProtection(false);
-        
-        // Force window redraw on macOS
-        if (process.platform === 'darwin') {
-          const bounds = mainWindow.getBounds();
-          mainWindow.setBounds({ 
-            x: bounds.x, 
-            y: bounds.y, 
-            width: bounds.width + 1, 
-            height: bounds.height 
-          });
-          setTimeout(() => {
-            mainWindow.setBounds(bounds);
-          }, 10);
-        }
-        
-        // Notify renderer
-        mainWindow.webContents.send('screen-sharing-active', false);
-        console.log('Screen sharing exclusion deactivated');
-      } catch (error) {
-        console.error('Error disabling screen sharing protection:', error);
-      }
-    }
-  }
-});
-
-ipcMain.on('get-answer', async (event, transcript) => {
-  await getOpenAIAnswer(transcript || currentTranscript)
-})
-
 ipcMain.on('new-chat', () => {
-  currentTranscript = ''
+  currentTranscript = '';
+  conversation = [];
   if (isRecording) {
-    isRecording = false
-    if (recording) {
-      record.stop()
-      recording = null
-    }
+    isRecording = false;
     if (recognizeStream) {
-      recognizeStream.end()
-      recognizeStream = null
-    }
-    if (mainWindow) {
-      mainWindow.webContents.send('recording-stopped')
-    }
-  }
-  if (mainWindow) {
-    mainWindow.webContents.send('transcript', '')
-  }
-})
-
-ipcMain.on('recording-stopped', () => {
-  if (mainWindow) {
-    mainWindow.webContents.send('update-recording-status', false)
-  }
-})
-
-// Handle audio data from renderer process
-ipcMain.on('audio-data', async (event, base64Audio) => {
-  try {
-    if (!base64Audio) {
-      console.error('No audio data received');
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('transcript', 'Error: No audio data received');
+      try {
+        recognizeStream.end();
+      } catch (_) {
+        /* noop */
       }
-      return;
+      recognizeStream = null;
     }
-
-    const audioBuffer = Buffer.from(base64Audio, 'base64');
-    console.log('Received audio data from renderer, size:', audioBuffer.length);
-
-    if (audioBuffer.length < 100) {
-      console.error('Audio buffer too small, likely empty recording');
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('transcript', 'No speech detected. Please try again.');
-      }
-      return;
-    }
-
-    // Convert audio to LINEAR16 format
-    const request = {
-      config: {
-        encoding: 'WEBM_OPUS',  // Updated to match the browser's MediaRecorder format
-        sampleRateHertz: 48000, // Updated to match MediaRecorder's default 48kHz
-        languageCode: 'en-US',
-        enableAutomaticPunctuation: true,
-        model: 'default',
-        useEnhanced: true,
-      },
-      audio: {
-        content: audioBuffer
-      }
-    };
-
-    console.log('Sending audio to Google Speech-to-Text...');
-    // Process audio with Google Speech-to-Text
-    const [response] = await speechClient.recognize(request);
-    
-    if (!response || !response.results || response.results.length === 0) {
-      console.log('No transcription results available');
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('transcript', 'No speech detected. Please try again.');
-      }
-      return;
-    }
-    
-    const transcription = response.results
-      .map(result => result.alternatives[0].transcript)
-      .join('\n');
-
-    if (transcription) {
-      console.log('Transcription:', transcription);
-      currentTranscript = transcription;
-      
-      // Send transcription to renderer
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('transcript', transcription);
-        // Automatically get answer from OpenAI
-        await getOpenAIAnswer(transcription);
-      }
-    } else {
-      console.log('No transcription available');
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('transcript', 'No speech detected. Please try again.');
-      }
-    }
-  } catch (error) {
-    console.error('Error processing audio:', error);
     if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('transcript', `Error: ${error.message || 'Unknown error'}`);
+      mainWindow.webContents.send('recording-stopped');
     }
+  }
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send('transcript', '');
   }
 });
 
-app.whenReady().then(createWindow)
+// -----------------------------------------------------------------------------
+// IPC: model + preset + summarize
+// -----------------------------------------------------------------------------
+
+ipcMain.on('set-model', (_event, model) => {
+  if (SUPPORTED_MODELS.includes(model)) {
+    activeModel = model;
+    console.log('Active model:', activeModel);
+  }
+});
+
+ipcMain.on('set-preset', (_event, preset) => {
+  if (PRESETS[preset]) {
+    activePreset = preset;
+    console.log('Active preset:', activePreset);
+  }
+});
+
+ipcMain.on('cancel-answer', () => {
+  if (activeAnswerAbort) {
+    try {
+      activeAnswerAbort.abort();
+    } catch (_) {
+      /* noop */
+    }
+    activeAnswerAbort = null;
+  }
+});
+
+ipcMain.on('summarize', async () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (conversation.length === 0 && !currentTranscript) {
+    mainWindow.webContents.send('answer', 'Nothing to summarize yet — record something first.');
+    return;
+  }
+
+  const transcriptDump = [
+    ...conversation.map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`),
+    currentTranscript ? `User (live): ${currentTranscript}` : ''
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  const messages = [
+    {
+      role: 'system',
+      content:
+        "You are an assistant that summarizes meeting transcripts. Output exactly two sections in markdown:\n" +
+        "**Summary** — 2-4 short bullet points capturing the discussion.\n" +
+        "**Action items** — a bulleted list of concrete next actions, each starting with an owner if mentioned, otherwise '— '."
+    },
+    { role: 'user', content: `Transcript so far:\n\n${transcriptDump}` }
+  ];
+
+  try {
+    mainWindow.webContents.send('answer-status', 'Summarizing...');
+    await streamCompletion(messages, { synthetic: '[Summarize]' });
+  } catch (e) {
+    console.error('Summarize error:', e);
+    mainWindow.webContents.send('answer', `Sorry, summarize failed: ${e.message}`);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// OpenAI streaming
+// -----------------------------------------------------------------------------
+
+async function streamAnswer(userText) {
+  const messages = [
+    { role: 'system', content: PRESETS[activePreset].system },
+    ...conversation,
+    { role: 'user', content: userText }
+  ];
+  await streamCompletion(messages, { userText });
+}
+
+/**
+ * Streams an OpenAI chat completion to the renderer via IPC.
+ * Sends `answer-stream-start`, repeated `answer-stream-chunk`, and `answer-stream-end`.
+ * On failure, falls back to a single `answer` event with an error message.
+ */
+async function streamCompletion(messages, opts = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  if (!process.env.OPENAI_API_KEY) {
+    mainWindow.webContents.send(
+      'answer',
+      'OPENAI_API_KEY is not set. Add it to your .env file and restart Angel.'
+    );
+    return;
+  }
+
+  // Try active model first, then fall back through SUPPORTED_MODELS.
+  const orderedModels = [activeModel, ...SUPPORTED_MODELS.filter(m => m !== activeModel)];
+
+  // Cancel any prior in-flight answer.
+  if (activeAnswerAbort) {
+    try {
+      activeAnswerAbort.abort();
+    } catch (_) {
+      /* noop */
+    }
+  }
+  const abortController = new AbortController();
+  activeAnswerAbort = abortController;
+
+  let lastError = null;
+  for (const model of orderedModels) {
+    try {
+      const stream = await openai.chat.completions.create(
+        {
+          model,
+          messages,
+          temperature: 0.3,
+          max_tokens: 400,
+          stream: true
+        },
+        { signal: abortController.signal }
+      );
+
+      mainWindow.webContents.send('answer-stream-start', { model, userText: opts.userText || opts.synthetic || '' });
+      let full = '';
+      for await (const chunk of stream) {
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta) {
+          full += delta;
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            mainWindow.webContents.send('answer-stream-chunk', delta);
+          }
+        }
+      }
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('answer-stream-end', { full, model });
+      }
+
+      // Persist to conversation history (skip synthetic entries like summaries).
+      if (opts.userText) {
+        conversation.push({ role: 'user', content: opts.userText });
+        conversation.push({ role: 'assistant', content: full });
+        // Cap history to keep token usage bounded.
+        const MAX_TURNS = 20;
+        if (conversation.length > MAX_TURNS * 2) {
+          conversation = conversation.slice(-MAX_TURNS * 2);
+        }
+      }
+
+      activeAnswerAbort = null;
+      return;
+    } catch (err) {
+      if (err?.name === 'AbortError') {
+        console.log('Answer aborted');
+        activeAnswerAbort = null;
+        return;
+      }
+      console.error(`Model ${model} failed:`, err.message || err);
+      lastError = err;
+      // Try next model
+    }
+  }
+
+  activeAnswerAbort = null;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    const msg = lastError ? lastError.message : 'unknown error';
+    mainWindow.webContents.send('answer', `Sorry, I couldn't generate an answer: ${msg}`);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Screen sharing exclusion (unchanged behavior, refactored for clarity)
+// -----------------------------------------------------------------------------
+
+ipcMain.on('toggle-screen-sharing-mode', (_event, isScreenSharing) => {
+  if (!mainWindow) return;
+  isInScreenSharingMode = isScreenSharing;
+
+  if (isScreenSharing) {
+    if (process.platform === 'darwin') {
+      try {
+        mainWindow.setContentProtection(true);
+        mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+        mainWindow.setAlwaysOnTop(true, 'floating', 1);
+        mainWindow.setWindowButtonVisibility(false);
+        mainWindow.setOpacity(0.99);
+
+        const bounds = mainWindow.getBounds();
+        mainWindow.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width + 1, height: bounds.height });
+        setTimeout(() => mainWindow.setBounds(bounds), 10);
+
+        mainWindow.setVibrancy('popover');
+        setTimeout(() => mainWindow.setVibrancy(null), 50);
+      } catch (e) {
+        console.error('macOS screen-sharing protection failed:', e);
+      }
+    } else if (isWindows) {
+      try {
+        mainWindow.setContentProtection(true);
+        mainWindow.setAlwaysOnTop(true, 'screen-saver', 1);
+      } catch (e) {
+        console.error('Windows screen-sharing protection failed:', e);
+      }
+    }
+    mainWindow.webContents.send('screen-sharing-active', true);
+    return;
+  }
+
+  try {
+    mainWindow.setOpacity(1.0);
+    if (process.platform === 'darwin') {
+      mainWindow.setWindowButtonVisibility(true);
+      mainWindow.setVisibleOnAllWorkspaces(false);
+    }
+    mainWindow.setAlwaysOnTop(true);
+    mainWindow.setContentProtection(false);
+    if (process.platform === 'darwin') {
+      const bounds = mainWindow.getBounds();
+      mainWindow.setBounds({ x: bounds.x, y: bounds.y, width: bounds.width + 1, height: bounds.height });
+      setTimeout(() => mainWindow.setBounds(bounds), 10);
+    }
+    mainWindow.webContents.send('screen-sharing-active', false);
+  } catch (e) {
+    console.error('Disable screen-sharing failed:', e);
+  }
+});
+
+// -----------------------------------------------------------------------------
+// App lifecycle
+// -----------------------------------------------------------------------------
+
+app.whenReady().then(createWindow);
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') {
-    app.quit()
+    app.quit();
   }
-})
+});
 
 app.on('activate', () => {
   if (BrowserWindow.getAllWindows().length === 0) {
-    createWindow()
+    createWindow();
   }
-})
-
-process.on('uncaughtException', (error) => {
-  console.error('Uncaught Exception:', error)
-})
-
-process.on('unhandledRejection', (error) => {
-  console.error('Unhandled Rejection:', error)
-})
+});

@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com; font-src 'self' https://cdnjs.cloudflare.com https://fonts.gstatic.com; script-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self'">
     <title>Angel - AI Meeting Assistant</title>
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Playfair+Display:wght@700&display=swap" rel="stylesheet">
@@ -551,6 +552,84 @@
             margin-left: 0.25rem;
             color: #6b7280;
         }
+
+        /* Settings strip (model picker / preset / summarize) */
+        .settings-strip {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 0.5rem;
+            padding: 0.5rem 0.9rem;
+            background-color: #f9fafb;
+            border-top: 1px solid var(--border);
+            flex-wrap: wrap;
+        }
+
+        .settings-strip select {
+            font-family: inherit;
+            font-size: 0.7rem;
+            padding: 0.3rem 0.5rem;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background-color: white;
+            color: var(--text);
+            cursor: pointer;
+            transition: var(--transition);
+        }
+
+        .settings-strip select:hover { border-color: var(--primary-light); }
+        .settings-strip select:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15); }
+
+        .summarize-button {
+            font-family: inherit;
+            font-size: 0.7rem;
+            padding: 0.3rem 0.65rem;
+            border: 1px solid var(--border);
+            border-radius: var(--radius-sm);
+            background-color: white;
+            color: var(--text);
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 0.3rem;
+            transition: var(--transition);
+        }
+
+        .summarize-button:hover {
+            background-color: var(--primary);
+            color: white;
+            border-color: var(--primary);
+        }
+
+        .summarize-button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .summarize-button i { font-size: 0.7rem; }
+
+        .config-warning {
+            display: none;
+            padding: 0.5rem 0.9rem;
+            background-color: #fef3c7;
+            color: #92400e;
+            font-size: 0.7rem;
+            text-align: center;
+            border-bottom: 1px solid #fde68a;
+        }
+
+        .config-warning.visible { display: block; }
+
+        /* Streaming answer caret */
+        .message.streaming .message-content::after {
+            content: '\25AE';
+            display: inline-block;
+            margin-left: 2px;
+            color: var(--primary);
+            animation: blink 1s steps(2, start) infinite;
+        }
+
+        @keyframes blink { to { visibility: hidden; } }
     </style>
 </head>
 <body>
@@ -584,6 +663,18 @@
 
         <!-- Main App Content (initially hidden) -->
         <div id="appContent" class="content hidden">
+            <!-- Config warning (e.g. missing API key) -->
+            <div id="configWarning" class="config-warning"></div>
+
+            <!-- Settings strip: model + preset + summarize -->
+            <div class="settings-strip">
+                <select id="modelSelect" title="Model" aria-label="Model"></select>
+                <select id="presetSelect" title="Conversation preset" aria-label="Preset"></select>
+                <button id="summarizeButton" class="summarize-button" title="Summarize conversation + extract action items">
+                    <i class="fas fa-list-check"></i> Summarize
+                </button>
+            </div>
+
             <!-- Chat Messages Area - no header -->
             <div class="chat-messages" id="chatMessages">
                 <!-- Welcome message -->
@@ -627,8 +718,10 @@
     
     <!-- JavaScript -->
     <script>
-        const { ipcRenderer } = require('electron');
-        
+        // Renderer talks to main only via the contextBridge-exposed window.api.
+        // No direct require('electron') — nodeIntegration is disabled and contextIsolation is on.
+        const api = window.api;
+
         // Get all necessary DOM elements
         const startAppButton = document.getElementById('startApp');
         const welcomeScreen = document.getElementById('welcomeScreen');
@@ -641,12 +734,21 @@
         const liveTranscript = document.getElementById('liveTranscript');
         const transcriptText = document.getElementById('transcriptText');
         const liveIndicator = document.getElementById('liveIndicator');
-        
+        const modelSelect = document.getElementById('modelSelect');
+        const presetSelect = document.getElementById('presetSelect');
+        const summarizeButton = document.getElementById('summarizeButton');
+        const configWarning = document.getElementById('configWarning');
+
         let isRecording = false;
         let isProcessingToggle = false;
         let mediaRecorder = null;
         let audioChunks = [];
         let messages = [];
+
+        // Streaming-answer state
+        let streamingMessageDiv = null;
+        let streamingContentSpan = null;
+        let streamingFullText = '';
 
         // Make sure appContent is hidden initially
         appContent.classList.add('hidden');
@@ -780,7 +882,7 @@
                             reader.onload = () => {
                                 const base64Audio = reader.result.split(',')[1];
                                 // Send this chunk to the main process for real-time processing
-                                ipcRenderer.send('stream-audio-chunk', base64Audio);
+                                api.send('stream-audio-chunk', base64Audio);
                             };
                             reader.readAsDataURL(event.data);
                         }
@@ -790,7 +892,7 @@
                     mediaRecorder.start(100);
                     
                     // Signal to main process that we're starting to record
-                    ipcRenderer.send('toggle-recording', true);
+                    api.send('toggle-recording', true);
                     
                     isRecording = true;
                 } else {
@@ -806,8 +908,8 @@
                     liveIndicator.classList.add('hidden');
                     
                     // Tell the main process to stop recording
-                    ipcRenderer.send('stop-audio-stream');
-                    ipcRenderer.send('toggle-recording', false);
+                    api.send('stop-audio-stream');
+                    api.send('toggle-recording', false);
                     
                     // Stop the MediaRecorder
                     try {
@@ -860,8 +962,8 @@
             // Reset status
             updateStatus('Conversation reset. Press microphone or spacebar to start recording');
             
-            // Tell main process to reset transcript
-            ipcRenderer.send('reset-transcript');
+            // Tell main process to reset transcript AND clear the conversation history.
+            api.send('new-chat');
         }
         
         // Mic button click handler
@@ -904,71 +1006,140 @@
             }
             
             // Then tell main process to apply the actual exclusion
-            ipcRenderer.send('toggle-screen-sharing-mode', isHideMode);
+            api.send('toggle-screen-sharing-mode', isHideMode);
         });
         
-        // IPC event handlers
-        
-        // Handle live transcript updates
-        ipcRenderer.on('transcript', (event, text) => {
+        // ---- IPC event handlers (via window.api / contextBridge) ----
+
+        // Live transcript updates
+        api.on('transcript', (text) => {
             if (text && text.trim() && text !== 'Recording...') {
                 updateLiveTranscript(text);
             }
         });
 
-        // Handle recording started
-        ipcRenderer.on('recording-started', () => {
+        api.on('recording-started', () => {
             console.log('Recording started signal received');
         });
-        
-        // Handle recording stopped
-        ipcRenderer.on('recording-stopped', () => {
+
+        api.on('recording-stopped', () => {
             console.log('Recording stopped signal received');
-            
-            // Update UI if needed
             if (isRecording) {
                 isRecording = false;
                 micButton.classList.remove('recording');
                 micButton.innerHTML = '<i class="fas fa-microphone"></i>';
             }
         });
-        
-        // Handle answers
-        ipcRenderer.on('answer', (event, text) => {
-            // Get transcript text
+
+        // Helper: commit the current live transcript as a user message in the chat,
+        // then create an empty AI message that we'll stream into.
+        function pinTranscriptAsUserMessageAndOpenStreamingBubble() {
             const transcript = transcriptText.textContent;
-            
-            // Only add transcript and answer if not empty
             if (transcript && transcript !== 'Listening...' && transcript !== 'Waiting for speech...') {
-                // Add the transcript as a user message
                 addMessage(transcript, true);
-                
-                // Add the answer
-                if (text && text.trim()) {
-                    addMessage(text, false);
-                } else {
-                    addMessage('No answer received. Please try again.', false);
-                }
-            } else {
-                addMessage('No speech detected. Please try again.', false);
             }
-            
-            // Update status
+            streamingMessageDiv = document.createElement('div');
+            streamingMessageDiv.className = 'message message-ai streaming';
+            streamingContentSpan = document.createElement('div');
+            streamingContentSpan.className = 'message-content';
+            streamingContentSpan.textContent = '';
+            streamingMessageDiv.appendChild(streamingContentSpan);
+            chatMessages.appendChild(streamingMessageDiv);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            streamingFullText = '';
+        }
+
+        api.on('answer-stream-start', (meta) => {
+            // meta = { model, userText }
+            pinTranscriptAsUserMessageAndOpenStreamingBubble();
+            updateStatus(meta && meta.model ? `Generating with ${meta.model}…` : 'Generating answer…');
+        });
+
+        api.on('answer-stream-chunk', (delta) => {
+            if (!streamingContentSpan) {
+                pinTranscriptAsUserMessageAndOpenStreamingBubble();
+            }
+            streamingFullText += delta;
+            streamingContentSpan.textContent = streamingFullText;
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        });
+
+        api.on('answer-stream-end', (meta) => {
+            // meta = { full, model }
+            if (streamingMessageDiv) {
+                streamingMessageDiv.classList.remove('streaming');
+            }
+            // Persist into the renderer's local message log.
+            if (streamingFullText) {
+                messages.push({ text: streamingFullText, isUser: false });
+            }
+            streamingMessageDiv = null;
+            streamingContentSpan = null;
+            streamingFullText = '';
             updateStatus('Press microphone or spacebar to start recording');
         });
-        
-        // Handle answer status updates
-        ipcRenderer.on('answer-status', (event, message) => {
+
+        // Non-streaming fallback (errors, validation messages, summarize when no transcript)
+        api.on('answer', (text) => {
+            const transcript = transcriptText.textContent;
+            if (transcript && transcript !== 'Listening...' && transcript !== 'Waiting for speech...' && !streamingMessageDiv) {
+                addMessage(transcript, true);
+            }
+            if (text && text.trim()) {
+                addMessage(text, false);
+            } else {
+                addMessage('No answer received. Please try again.', false);
+            }
+            updateStatus('Press microphone or spacebar to start recording');
+        });
+
+        api.on('answer-status', (message) => {
             updateStatus(message);
         });
-        
-        // Handle transcription errors
-        ipcRenderer.on('transcription-error', (event, errorMessage) => {
+
+        api.on('transcription-error', (errorMessage) => {
             console.error('Transcription error:', errorMessage);
             addMessage(`Error: ${errorMessage}`, false);
             updateStatus('Error during transcription. Please try again.');
         });
-        
+
+        // ---- Config from main (model list, presets, key-presence) ----
+        api.on('config', (cfg) => {
+            // Populate model select
+            modelSelect.innerHTML = '';
+            cfg.models.forEach(m => {
+                const opt = document.createElement('option');
+                opt.value = m;
+                opt.textContent = m;
+                if (m === cfg.activeModel) opt.selected = true;
+                modelSelect.appendChild(opt);
+            });
+
+            // Populate preset select
+            presetSelect.innerHTML = '';
+            Object.entries(cfg.presets).forEach(([key, label]) => {
+                const opt = document.createElement('option');
+                opt.value = key;
+                opt.textContent = label;
+                if (key === cfg.activePreset) opt.selected = true;
+                presetSelect.appendChild(opt);
+            });
+
+            if (!cfg.hasOpenAIKey) {
+                configWarning.textContent = 'OPENAI_API_KEY is not set. Add it to .env (see SETUP.md) and restart Angel.';
+                configWarning.classList.add('visible');
+            } else {
+                configWarning.classList.remove('visible');
+            }
+        });
+
+        modelSelect.addEventListener('change', () => api.send('set-model', modelSelect.value));
+        presetSelect.addEventListener('change', () => api.send('set-preset', presetSelect.value));
+        summarizeButton.addEventListener('click', () => {
+            api.send('summarize');
+            updateStatus('Summarizing…');
+        });
+
         // Initialize recording when the app starts
         initializeRecording().then(success => {
             if (!success) {
