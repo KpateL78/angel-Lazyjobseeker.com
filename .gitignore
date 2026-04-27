@@ -3,7 +3,6 @@ node_modules/
 npm-debug.log
 yarn-error.log
 yarn-debug.log
-package-lock.json
 
 # OS specific files
 .DS_Store
@@ -26,3 +25,10 @@ bin/
 
 # Logs
 *.log
+
+# Secrets - DO NOT COMMIT
+.env
+.env.local
+.env.*.local
+gcp-credentials.json
+lazy-job-seeker-*.json
